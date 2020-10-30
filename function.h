@@ -18,9 +18,9 @@ struct bad_function_call : std::exception {
 template <typename R, typename... Args>
 struct methods {
     R(*invoker)(storage_t const*, Args...);
-    void(*deleter)(storage_t*);
+    void(*deleter)(storage_t*) noexcept ;
     void(*cloner)(storage_t*, storage_t const*);
-    void(*mover)(storage_t*, storage_t*);
+    void(*mover)(storage_t*, storage_t*) noexcept ;
 };
 
 template <typename R, typename... Args>
@@ -29,9 +29,9 @@ methods<R, Args...> const* get_empty_methods() {
         [](storage_t const*, Args...) -> R {
             throw bad_function_call();
         },
-        [](storage_t*){},
+        [](storage_t*) noexcept {},
         [](storage_t*, storage_t const*){},
-        [](storage_t*, storage_t*){}
+        [](storage_t*, storage_t*) noexcept {}
     };
     return &table;
 }
@@ -41,11 +41,11 @@ struct object_traits;
 
 template <typename T>
 struct object_traits<T, false> {
-    static T const& cast_const(storage_t const* obj) {
+    static T const& cast_const(storage_t const* obj) noexcept {
         return *reinterpret_cast<T* const&>(*obj);
     }
 
-    static T*& cast_to_ptr(storage_t* obj) {
+    static T*& cast_to_ptr(storage_t* obj) noexcept {
         return reinterpret_cast<T*&>(*obj);
     }
 
@@ -55,13 +55,13 @@ struct object_traits<T, false> {
             [](storage_t const* obj, Args... args) -> R {
                 return cast_const(obj)(std::forward<Args>(args)...);
             },
-            [](storage_t* obj) {
+            [](storage_t* obj) noexcept {
                 delete cast_to_ptr(obj);
             },
             [](storage_t* dst, storage_t const* src) {
                 cast_to_ptr(dst) = new T(cast_const(src));
             },
-            [](storage_t* dst, storage_t* src) {
+            [](storage_t* dst, storage_t* src) noexcept {
                 cast_to_ptr(dst) = cast_to_ptr(src);;
                 cast_to_ptr(src) = nullptr;
             }
@@ -72,11 +72,11 @@ struct object_traits<T, false> {
 
 template <typename T>
 struct object_traits<T, true> {
-    static T const& cast_const(storage_t const* obj) {
+    static T const& cast_const(storage_t const* obj) noexcept {
         return reinterpret_cast<T const&>(*obj);
     }
 
-    static T& cast(storage_t* obj) {
+    static T& cast(storage_t* obj) noexcept {
         return reinterpret_cast<T&>(*obj);
     }
 
@@ -86,13 +86,13 @@ struct object_traits<T, true> {
             [](storage_t const* obj, Args... args) -> R {
                 return cast_const(obj)(std::forward<Args>(args)...);
             },
-            [](storage_t* obj) {
+            [](storage_t* obj) noexcept {
                 cast(obj).~T();
             },
             [](storage_t* dst, storage_t const* src) {
                 new (dst) T(cast_const(src));
             },
-            [](storage_t* dst, storage_t* src) {
+            [](storage_t* dst, storage_t* src) noexcept {
                 new (dst) T(std::move(cast(src)));
             }
         };
@@ -131,9 +131,18 @@ struct function<R (Args...)> {
 
     function& operator=(function const& rhs) {
         if (this != &rhs) {
+            storage_t tmp;
+            methods->mover(&tmp, &storage);
             methods->deleter(&storage);
-            methods = rhs.methods;
-            methods->cloner(&storage, &rhs.storage);
+            try {
+                rhs.methods->cloner(&storage, &rhs.storage);
+                methods->deleter(&tmp);
+                methods = rhs.methods;
+            } catch (...) {
+                methods->mover(&storage, &tmp);
+                methods->deleter(&tmp);
+                throw;
+            }
         }
         return *this;
     }
