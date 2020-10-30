@@ -129,24 +129,20 @@ struct function<R (Args...)> {
         methods = object_traits<T, is_small<T>>().template get_methods<R, Args...>();
     }
 
-    void swap(function& other) noexcept {
-        storage_t tmp;
-        methods->mover(&tmp, &other.storage);
-        methods->mover(&other.storage, &storage);
-        methods->mover(&storage, &tmp);
-        std::swap(methods, other.methods);
-    }
-
     function& operator=(function const& rhs) {
         if (this != &rhs) {
-            function(rhs).swap(*this);
+            methods->deleter(&storage);
+            methods = rhs.methods;
+            methods->cloner(&storage, &rhs.storage);
         }
         return *this;
     }
 
     function& operator=(function&& rhs) noexcept {
         if (this != &rhs) {
-            function(std::move(rhs)).swap(*this);
+            methods->deleter(&storage);
+            methods = rhs.methods;
+            methods->mover(&storage, &rhs.storage);
         }
         return *this;
     }
