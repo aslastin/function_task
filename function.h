@@ -3,7 +3,7 @@
 #include <type_traits>
 #include <exception>
 
-using obj_t = std::aligned_storage<sizeof(void*), alignof(void*)>::type;
+using storage_t = std::aligned_storage<sizeof(void*), alignof(void*)>::type;
 
 template <typename T>
 constexpr bool is_small = sizeof(T) <= sizeof(void*) &&
@@ -17,22 +17,21 @@ struct bad_function_call : std::exception {
 
 template <typename R, typename... Args>
 struct methods {
-    R(* invoker)(obj_t const*, Args...);
-    void(* deleter)(obj_t*);
-    obj_t(* cloner)(obj_t const*);
-    obj_t(* mover)(obj_t*);
+    R(*invoker)(storage_t const*, Args...);
+    void(*deleter)(storage_t*);
+    void(*cloner)(storage_t*, storage_t const*);
+    void(*mover)(storage_t*, storage_t*);
 };
 
 template <typename R, typename... Args>
 methods<R, Args...> const* get_empty_methods() {
-    static constexpr obj_t empty = obj_t();
     static constexpr methods<R, Args...> table {
-        [](obj_t const*, Args...) -> R {
+        [](storage_t const*, Args...) -> R {
             throw bad_function_call();
         },
-        [](obj_t*){},
-        [](obj_t const*){return empty;},
-        [](obj_t*){return empty;}
+        [](storage_t*){},
+        [](storage_t*, storage_t const*){},
+        [](storage_t*, storage_t*){}
     };
     return &table;
 }
@@ -42,33 +41,29 @@ struct object_traits;
 
 template <typename T>
 struct object_traits<T, false> {
-    static T const& cast_const(obj_t const* obj) {
+    static T const& cast_const(storage_t const* obj) {
         return *reinterpret_cast<T* const&>(*obj);
     }
 
-    static T*& cast_to_ptr(obj_t& obj) {
-        return reinterpret_cast<T*&>(obj);
+    static T*& cast_to_ptr(storage_t* obj) {
+        return reinterpret_cast<T*&>(*obj);
     }
 
     template <typename R, typename... Args>
     methods<R, Args...> const* get_methods() {
         static constexpr methods<R, Args...> table {
-            [](obj_t const* obj, Args... args) -> R {
+            [](storage_t const* obj, Args... args) -> R {
                 return cast_const(obj)(std::forward<Args>(args)...);
             },
-            [](obj_t* obj) {
-                delete cast_to_ptr(*obj);
+            [](storage_t* obj) {
+                delete cast_to_ptr(obj);
             },
-            [](obj_t const* obj) -> obj_t {
-                obj_t fresh_obj;
-                cast_to_ptr(fresh_obj) = new T(cast_const(obj));
-                return fresh_obj;
+            [](storage_t* dst, storage_t const* src) {
+                cast_to_ptr(dst) = new T(cast_const(src));
             },
-            [](obj_t* obj) -> obj_t {
-                obj_t fresh_obj;
-                cast_to_ptr(fresh_obj) = cast_to_ptr(*obj);;
-                cast_to_ptr(*obj) = nullptr;
-                return fresh_obj;
+            [](storage_t* dst, storage_t* src) {
+                cast_to_ptr(dst) = cast_to_ptr(src);;
+                cast_to_ptr(src) = nullptr;
             }
         };
         return &table;
@@ -77,32 +72,28 @@ struct object_traits<T, false> {
 
 template <typename T>
 struct object_traits<T, true> {
-    static T const& cast_const(obj_t const* obj) {
+    static T const& cast_const(storage_t const* obj) {
         return reinterpret_cast<T const&>(*obj);
     }
 
-    static T& cast(obj_t* obj) {
+    static T& cast(storage_t* obj) {
         return reinterpret_cast<T&>(*obj);
     }
 
     template <typename R, typename... Args>
     methods<R, Args...> const* get_methods() {
         static constexpr methods<R, Args...> table {
-            [](obj_t const* obj, Args... args) -> R {
+            [](storage_t const* obj, Args... args) -> R {
                 return cast_const(obj)(std::forward<Args>(args)...);
             },
-            [](obj_t* obj) {
+            [](storage_t* obj) {
                 cast(obj).~T();
             },
-            [](obj_t const* obj) -> obj_t {
-                obj_t fresh_obj;
-                new (&fresh_obj) T(cast_const(obj));
-                return fresh_obj;
+            [](storage_t* dst, storage_t const* src) {
+                new (dst) T(cast_const(src));
             },
-            [](obj_t* obj) -> obj_t {
-                obj_t fresh_obj;
-                new (&fresh_obj) T(cast(obj));
-                return fresh_obj;
+            [](storage_t* dst, storage_t* src) {
+                new (dst) T(std::move(cast(src)));
             }
         };
         return &table;
@@ -118,29 +109,31 @@ struct function<R (Args...)> {
         : methods(get_empty_methods<R, Args...>())
     {}
 
-    function(function const& other)
-        : obj(other.methods->cloner(&other.obj))
-        , methods(other.methods)
-    {}
+    function(function const& other) {
+        other.methods->cloner(&storage, &other.storage);
+        methods = other.methods;
+    }
 
-    function(function&& other) noexcept
-        : obj(other.methods->mover(&other.obj))
-        , methods(other.methods)
-    {}
+    function(function&& other) noexcept {
+        other.methods->mover(&storage, &other.storage);
+        methods = other.methods;
+    }
 
     template <typename T>
     function(T val) {
         if (is_small<T>) {
-            new (&obj) T(std::move(val));
+            new (&storage) T(std::move(val));
         } else {
-            reinterpret_cast<void*&>(obj) = new T(std::move(val));
+            reinterpret_cast<void*&>(storage) = new T(std::move(val));
         }
         methods = object_traits<T, is_small<T>>().template get_methods<R, Args...>();
     }
 
     void swap(function& other) noexcept {
-        using std::swap;
-        std::swap(obj, other.obj);
+        storage_t tmp;
+        methods->mover(&tmp, &other.storage);
+        methods->mover(&other.storage, &storage);
+        methods->mover(&storage, &tmp);
         std::swap(methods, other.methods);
     }
 
@@ -159,7 +152,7 @@ struct function<R (Args...)> {
     }
 
     ~function() {
-        methods->deleter(&obj);
+        methods->deleter(&storage);
     }
 
     explicit operator bool() const noexcept {
@@ -167,16 +160,16 @@ struct function<R (Args...)> {
     }
 
     R operator()(Args... args) const {
-        return methods->invoker(&obj, std::forward<Args>(args)...);
+        return methods->invoker(&storage, std::forward<Args>(args)...);
     }
 
     template <typename T>
     T* target() noexcept {
         if (methods == object_traits<T, is_small<T>>().template get_methods<R, Args...>()) {
             if (is_small<T>) {
-                return reinterpret_cast<T*>(&obj);
+                return reinterpret_cast<T*>(&storage);
             } else {
-                return reinterpret_cast<T*&>(obj);
+                return reinterpret_cast<T*&>(storage);
             }
         }
         return nullptr;
@@ -186,15 +179,15 @@ struct function<R (Args...)> {
     T const* target() const noexcept {
         if (methods == object_traits<T, is_small<T>>().template get_methods<R, Args...>()) {
             if (is_small<T>) {
-                return reinterpret_cast<const T*>(&obj);
+                return reinterpret_cast<const T*>(&storage);
             } else {
-                return reinterpret_cast<T* const&>(obj);
+                return reinterpret_cast<T* const&>(storage);
             }
         }
         return nullptr;
     }
 
  private:
-    obj_t obj;
+    storage_t storage;
     methods<R, Args...> const* methods;
 };
